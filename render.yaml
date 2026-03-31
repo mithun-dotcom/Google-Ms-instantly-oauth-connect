@@ -1,12 +1,10 @@
 services:
   - type: web
     name: instantly-oauth-backend
-    env: node
-    plan: free
-    buildCommand: npm install
-    startCommand: node server.js
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
     envVars:
-      - key: ALLOWED_ORIGIN
-        value: "*"
       - key: PORT
-        value: 10000
+        value: 3000
+    healthCheckPath: /

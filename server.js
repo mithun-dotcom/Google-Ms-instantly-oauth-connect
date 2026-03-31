@@ -1,73 +1,244 @@
-// server.js — Instantly OAuth Connector Backend
-// Deploy to Render (free tier)
 const express = require("express");
 const cors = require("cors");
+const puppeteer = require("puppeteer");
+const { execSync, spawn } = require("child_process");
+
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+app.use(cors());
 app.use(express.json());
-app.get("/", (_, res) => res.json({ status: "ok", service: "instantly-oauth-connector" }));
 
-app.post("/api/instantly", async (req, res) => {
-  const { action, apiKey, data } = req.body || {};
-  if (!apiKey) return res.json({ ok: false, error: "Missing API key" });
+const PORT = process.env.PORT || 3000;
 
-  const authHeaders = {
-    "Authorization": `Bearer ${apiKey}`,
-    "Content-Type": "application/json",
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ ok: true, service: "Instantly OAuth Bot", time: new Date().toISOString() }));
+
+// ── Helper: sleep ─────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── Helper: wait for selector safely ─────────────────────────────────────────
+async function waitFor(page, selector, timeout = 10000) {
+  try {
+    await page.waitForSelector(selector, { visible: true, timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Helper: type slowly like a human ─────────────────────────────────────────
+async function humanType(page, selector, text) {
+  await page.click(selector, { clickCount: 3 });
+  await page.type(selector, text, { delay: 60 + Math.random() * 60 });
+}
+
+// ── Launch browser with Xvfb ──────────────────────────────────────────────────
+let xvfbProc = null;
+function startXvfb() {
+  try {
+    execSync("pkill Xvfb", { stdio: "ignore" });
+  } catch {}
+  xvfbProc = spawn("Xvfb", [":99", "-screen", "0", "1280x900x24"], { detached: true, stdio: "ignore" });
+  xvfbProc.unref();
+  process.env.DISPLAY = ":99";
+  console.log("Xvfb started on :99");
+}
+
+async function launchBrowser() {
+  return puppeteer.launch({
+    headless: false,
+    executablePath: process.env.PUPPETEER_EXEC_PATH || "/usr/bin/google-chrome-stable",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--window-size=1280,900",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-infobars",
+    ],
+    env: { ...process.env, DISPLAY: ":99" },
+  });
+}
+
+// ── Instantly API helpers ─────────────────────────────────────────────────────
+async function instantlyRequest(path, method, apiKey, body = null) {
+  const opts = {
+    method,
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
   };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`https://api.instantly.ai/api/v2${path}`, opts);
+  const j = await res.json();
+  if (!res.ok) throw new Error(j.message || j.error || `Instantly ${res.status}`);
+  return j;
+}
+
+async function initOAuth(apiKey) {
+  return instantlyRequest("/oauth/microsoft/init", "POST", apiKey, {});
+}
+
+async function pollSession(apiKey, sessionId) {
+  return instantlyRequest(`/oauth/session/status/${sessionId}`, "GET", apiKey);
+}
+
+async function accountExists(apiKey, email) {
+  const j = await instantlyRequest(`/accounts?search=${encodeURIComponent(email)}&limit=5`, "GET", apiKey);
+  return (j.items || []).some((a) => a.email?.toLowerCase() === email.toLowerCase());
+}
+
+// ── Core: login one account ───────────────────────────────────────────────────
+async function loginAccount(apiKey, email, password) {
+  // 1. Init OAuth session from Instantly
+  const session = await initOAuth(apiKey);
+  const sessionId = session.session_id || session.sessionId;
+  let authUrl = session.auth_url || session.authUrl || "";
+
+  if (!authUrl || !sessionId) throw new Error("Instantly did not return authUrl or sessionId");
+
+  // Fix duplicate prompt param (Instantly bug)
+  try {
+    const u = new URL(authUrl);
+    const prompts = u.searchParams.getAll("prompt");
+    if (prompts.length > 1) {
+      u.searchParams.delete("prompt");
+      u.searchParams.set("prompt", prompts[0]);
+    }
+    // Pre-fill email via login_hint
+    u.searchParams.set("login_hint", email);
+    authUrl = u.toString();
+  } catch {}
+
+  // 2. Open browser and navigate
+  const browser = await launchBrowser();
+  const page = await browser.newPage();
+
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+  );
+  await page.setViewport({ width: 1280, height: 900 });
 
   try {
-    let result;
+    await page.goto(authUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await sleep(1500);
 
-    if (action === "init_oauth") {
-      const provider = data?.provider || "microsoft"; // "google" or "microsoft"
-      const r = await fetch(`https://api.instantly.ai/api/v2/oauth/${provider}/init`, {
-        method: "POST", headers: authHeaders, body: JSON.stringify({}),
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.message || j.error || `Instantly error ${r.status}`);
-
-      let authUrl = j.auth_url || j.authUrl || "";
-      if (data?.email && authUrl) {
-        const sep = authUrl.includes("?") ? "&" : "?";
-        if (provider === "microsoft") {
-          const domain = data.email.split("@")[1] || "";
-          // For Microsoft: login_hint pre-fills email, prompt=login bypasses account picker
-          authUrl += `${sep}login_hint=${encodeURIComponent(data.email)}&prompt=login&domain_hint=${encodeURIComponent(domain)}`;
-        } else {
-          // For Google: login_hint pre-fills email
-          authUrl += `${sep}login_hint=${encodeURIComponent(data.email)}`;
-        }
+    // 3. Type email if not pre-filled
+    const emailField = await waitFor(page, 'input[type="email"], input[name="loginfmt"]', 6000);
+    if (emailField) {
+      const currentVal = await page.$eval(
+        'input[type="email"], input[name="loginfmt"]',
+        (el) => el.value
+      ).catch(() => "");
+      if (!currentVal || !currentVal.includes("@")) {
+        await humanType(page, 'input[type="email"], input[name="loginfmt"]', email);
+        await sleep(400);
       }
-      result = { sessionId: j.session_id || j.sessionId, authUrl };
+      // Click Next
+      const nextBtn = await page.$('input[type="submit"], button[type="submit"]');
+      if (nextBtn) {
+        await nextBtn.click();
+        await sleep(2000);
+      }
     }
 
-    else if (action === "poll_session") {
-      const r = await fetch(
-        `https://api.instantly.ai/api/v2/oauth/session/status/${data.sessionId}`,
-        { headers: authHeaders }
-      );
-      const j = await r.json();
-      result = { status: j.status, email: j.email, error: j.error_description || j.error };
+    // 4. Type password
+    const passField = await waitFor(page, 'input[type="password"], input[name="passwd"]', 10000);
+    if (!passField) throw new Error("Password field not found — check if account needs MFA or is locked");
+
+    await humanType(page, 'input[type="password"], input[name="passwd"]', password);
+    await sleep(500);
+
+    // 5. Click Sign in
+    const signInBtn = await page.$('input[type="submit"][value="Sign in"], button[type="submit"]');
+    if (signInBtn) {
+      await signInBtn.click();
+    } else {
+      await page.keyboard.press("Enter");
+    }
+    await sleep(3000);
+
+    // 6. Handle "Stay signed in?" → click No
+    const staySignedIn = await waitFor(page, '#idBtn_Back, input[value="No"]', 8000);
+    if (staySignedIn) {
+      const noBtn = await page.$('#idBtn_Back, input[value="No"]');
+      if (noBtn) {
+        await noBtn.click();
+        await sleep(1500);
+      }
     }
 
-    else if (action === "check_account") {
-      const r = await fetch(
-        `https://api.instantly.ai/api/v2/accounts?search=${encodeURIComponent(data.email)}&limit=5`,
-        { headers: authHeaders }
-      );
-      const j = await r.json();
-      result = { exists: (j.items || []).some(a => a.email?.toLowerCase() === data.email.toLowerCase()) };
+    // 7. Poll Instantly session until success or error
+    let connected = false;
+    let lastError = "";
+    for (let i = 0; i < 30; i++) {
+      await sleep(2000);
+      try {
+        const status = await pollSession(apiKey, sessionId);
+        if (status.status === "success") {
+          connected = true;
+          break;
+        }
+        if (status.status === "error" || status.status === "expired") {
+          lastError = status.error_description || status.error || status.status;
+          break;
+        }
+      } catch {}
     }
 
-    else throw new Error(`Unknown action: ${action}`);
+    await browser.close();
 
-    res.json({ ok: true, result });
+    if (connected) return { ok: true };
+    throw new Error(lastError || "Session did not complete — possible wrong password or MFA required");
+  } catch (err) {
+    try { await browser.close(); } catch {}
+    throw err;
+  }
+}
+
+// ── POST /api/connect ─────────────────────────────────────────────────────────
+// Body: { apiKey, email, password }
+app.post("/api/connect", async (req, res) => {
+  const { apiKey, email, password } = req.body || {};
+  if (!apiKey || !email || !password) {
+    return res.json({ ok: false, error: "Missing apiKey, email, or password" });
+  }
+  try {
+    // Check if already exists
+    const exists = await accountExists(apiKey, email);
+    if (exists) return res.json({ ok: true, skipped: true });
+
+    await loginAccount(apiKey, email, password);
+    res.json({ ok: true, skipped: false });
   } catch (err) {
     res.json({ ok: false, error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Instantly OAuth backend running on port ${PORT}`));
+// ── POST /api/check ───────────────────────────────────────────────────────────
+app.post("/api/check", async (req, res) => {
+  const { apiKey, email } = req.body || {};
+  if (!apiKey || !email) return res.json({ ok: false, error: "Missing apiKey or email" });
+  try {
+    const exists = await accountExists(apiKey, email);
+    res.json({ ok: true, exists });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// ── POST /api/list ────────────────────────────────────────────────────────────
+app.post("/api/list", async (req, res) => {
+  const { apiKey, skip = 0 } = req.body || {};
+  if (!apiKey) return res.json({ ok: false, error: "Missing apiKey" });
+  try {
+    const j = await instantlyRequest(`/accounts?limit=100&skip=${skip}`, "GET", apiKey);
+    res.json({ ok: true, accounts: j.items || [], total: j.total });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  startXvfb();
+});
