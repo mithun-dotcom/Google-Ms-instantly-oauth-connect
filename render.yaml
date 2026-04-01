@@ -1,10 +1,1 @@
-services:
-  - type: web
-    name: instantly-oauth-backend
-    env: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    envVars:
-      - key: PORT
-        value: 3000
-    healthCheckPath: /
+
