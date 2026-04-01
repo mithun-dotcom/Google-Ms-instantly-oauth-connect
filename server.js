@@ -7,12 +7,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "Instantly OAuth Backend", time: new Date().toISOString() });
 });
 
-// ── Instantly API proxy ───────────────────────────────────────────────────────
 app.post("/api/instantly", async (req, res) => {
   try {
     const { action, apiKey, data } = req.body || {};
@@ -25,7 +23,7 @@ app.post("/api/instantly", async (req, res) => {
 
     let result;
 
-    // ── Init OAuth session ──────────────────────────────────────────────────
+    // ── Init OAuth session ────────────────────────────────────────────────────
     if (action === "init_oauth") {
       const provider = data?.provider || "microsoft";
       const endpoint = provider === "google"
@@ -40,23 +38,15 @@ app.post("/api/instantly", async (req, res) => {
       const j = await r.json();
       if (!r.ok) throw new Error(j.message || j.error || `Instantly error ${r.status}`);
 
-      // Fix duplicate prompt param + add login_hint to pre-fill email
-      let authUrl = j.auth_url || j.authUrl || "";
-      try {
-        const u = new URL(authUrl);
-        const prompts = u.searchParams.getAll("prompt");
-        if (prompts.length > 1) {
-          u.searchParams.delete("prompt");
-          u.searchParams.set("prompt", prompts[0]);
-        }
-        if (data?.email) u.searchParams.set("login_hint", data.email);
-        authUrl = u.toString();
-      } catch {}
+      // !! Pass authUrl 100% untouched — Instantly signs the state param.
+      // Any modification (login_hint, prompt dedup, anything) breaks the
+      // signature and causes U402 on the redirect callback.
+      const authUrl = j.auth_url || j.authUrl || "";
 
       result = { sessionId: j.session_id || j.sessionId, authUrl };
     }
 
-    // ── Poll session status ─────────────────────────────────────────────────
+    // ── Poll session status ───────────────────────────────────────────────────
     else if (action === "poll_session") {
       const r = await fetch(
         `https://api.instantly.ai/api/v2/oauth/session/status/${data.sessionId}`,
@@ -66,7 +56,7 @@ app.post("/api/instantly", async (req, res) => {
       result = { status: j.status, email: j.email, error: j.error_description || j.error };
     }
 
-    // ── Check if account already exists ────────────────────────────────────
+    // ── Check if account already exists ──────────────────────────────────────
     else if (action === "check_account") {
       const r = await fetch(
         `https://api.instantly.ai/api/v2/accounts?search=${encodeURIComponent(data.email)}&limit=5`,
@@ -79,7 +69,7 @@ app.post("/api/instantly", async (req, res) => {
       result = { exists };
     }
 
-    // ── List accounts ───────────────────────────────────────────────────────
+    // ── List accounts ─────────────────────────────────────────────────────────
     else if (action === "list_accounts") {
       const r = await fetch(
         `https://api.instantly.ai/api/v2/accounts?limit=100&skip=${data?.skip || 0}`,
